@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FLOWGRID — Autonomous Traffic Control Simulation</title>
+<style>
+  :root{
+    --asphalt:#101317; --panel:#171b21; --line:#262c35;
+    --lane:#e8b64c; --ink:#e8ecf2; --dim:#8a93a3;
+    --go:#3ecf7a; --halt:#ef5350; --amber:#f0a832; --route:#5ec8e0;
+  }
+  *{box-sizing:border-box;margin:0}
+  html,body{height:100%}
+  body{background:var(--asphalt);color:var(--ink);
+       font:14px/1.45 ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+       display:flex;flex-direction:column}
+  header{display:flex;align-items:baseline;gap:14px;padding:14px 20px 10px;
+         border-bottom:1px solid var(--line)}
+  header h1{font:700 17px/1 ui-monospace,Menlo,monospace;letter-spacing:.22em}
+  header h1 b{color:var(--lane)}
+  header .sub{color:var(--dim);font-size:12px;letter-spacing:.06em}
+  main{flex:1;display:flex;min-height:0}
+  #wrap{flex:1;position:relative;min-width:0}
+  canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+  aside{width:280px;border-left:1px solid var(--line);background:var(--panel);
+        padding:16px;display:flex;flex-direction:column;gap:18px;overflow-y:auto}
+  .grp label{display:block;color:var(--dim);font-size:11px;letter-spacing:.14em;
+             text-transform:uppercase;margin-bottom:8px}
+  .seg{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+  .seg button{flex:1;background:none;border:0;color:var(--dim);padding:8px 4px;
+              font:inherit;font-size:12px;cursor:pointer}
+  .seg button.on{background:#232a34;color:var(--ink)}
+  .seg button.on.go{color:var(--go)} .seg button.on.rt{color:var(--route)}
+  input[type=range]{width:100%;accent-color:var(--lane)}
+  .val{float:right;color:var(--ink)}
+  .stats{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .stat{border:1px solid var(--line);border-radius:6px;padding:10px}
+  .stat .n{font-size:21px;font-weight:700;letter-spacing:.02em}
+  .stat .l{color:var(--dim);font-size:10px;letter-spacing:.12em;text-transform:uppercase;margin-top:2px}
+  .stat.hot .n{color:var(--lane)}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th{color:var(--dim);font-weight:400;text-align:left;font-size:10px;
+     letter-spacing:.12em;text-transform:uppercase;padding:4px 6px;border-bottom:1px solid var(--line)}
+  td{padding:5px 6px;border-bottom:1px solid var(--line)}
+  td.best{color:var(--go)}
+  .row{display:flex;gap:8px}
+  .btn{flex:1;background:none;border:1px solid var(--line);border-radius:6px;
+       color:var(--ink);padding:8px;font:inherit;font-size:12px;cursor:pointer}
+  .btn:hover{border-color:var(--dim)}
+  footer{padding:8px 20px;color:var(--dim);font-size:11px;border-top:1px solid var(--line)}
+  @media (max-width:760px){main{flex-direction:column}aside{width:100%;border-left:0;
+    border-top:1px solid var(--line)}#wrap{min-height:52vh}}
+</style>
+</head>
+<body>
+<header>
+  <h1>FLOW<b>GRID</b></h1>
+  <span class="sub">self-driven fleet · load-aware routing · adaptive signals — live simulation</span>
+</header>
+<main>
+  <div id="wrap"><canvas id="cv"></canvas></div>
+  <aside>
+    <div class="grp"><label>Signal control</label>
+      <div class="seg" id="sigSeg">
+        <button data-v="fixed">Fixed cycle</button>
+        <button data-v="adaptive" class="on go">Adaptive (pressure)</button>
+      </div></div>
+    <div class="grp"><label>Vehicle routing</label>
+      <div class="seg" id="rtSeg">
+        <button data-v="static">Shortest path</button>
+        <button data-v="load" class="on rt">Load-adaptive</button>
+      </div></div>
+    <div class="grp"><label>Demand <span class="val" id="demV">900 veh/h</span></label>
+      <input type="range" id="dem" min="200" max="2400" step="50" value="900"></div>
+    <div class="grp"><label>Sim speed <span class="val" id="spdV">2×</span></label>
+      <input type="range" id="spd" min="1" max="8" step="1" value="2"></div>
+    <div class="grp"><label>Network — live</label>
+      <div class="stats">
+        <div class="stat hot"><div class="n" id="sTrip">–</div><div class="l">avg trip s</div></div>
+        <div class="stat"><div class="n" id="sWait">–</div><div class="l">avg wait s</div></div>
+        <div class="stat"><div class="n" id="sThru">0</div><div class="l">done / h</div></div>
+        <div class="stat"><div class="n" id="sAct">0</div><div class="l">on road</div></div>
+      </div></div>
+    <div class="grp"><label>Strategy scoreboard (avg trip s)</label>
+      <table id="board"><tr><th>signals</th><th>routing</th><th>trip</th><th>n</th></tr></table></div>
+    <div class="row">
+      <button class="btn" id="pause">Pause</button>
+      <button class="btn" id="reset">Reset run</button>
+    </div>
+  </aside>
+</main>
+<footer>Road glow = live load · every car re-plans at each junction when load-adaptive routing is on · switch strategies mid-run and watch the scoreboard.</footer>
+
+<script>
+"use strict";
+/* ================= SIM CORE (DOM-free: also runs under Node for tests) ===== */
+const CFG = {
+  cols:3, rows:3, gap:210, stub:120,          // network geometry (world units)
+  vmax:34, acc:60, minGap:11, carLen:9,       // vehicle dynamics (u/s)
+  cap:14,                                     // cars per edge before "jam" cost blows up
+  minGreen:6, yellow:2.4, fixedGreen:14,      // signal timing (s)
+  routeAlpha:4,                               // congestion weight in edge cost
+};
+function mulberry(seed){return function(){seed|=0;seed=seed+0x6D2B79F5|0;
+  let t=Math.imul(seed^seed>>>15,1|seed);t=t+Math.imul(t^t>>>7,61|t)^t;
+  return ((t^t>>>14)>>>0)/4294967296}}
+
+function buildNetwork(){
+  const nodes=[],edges=[],id={};
+  const px=c=>140+c*CFG.gap, py=r=>110+r*CFG.gap;
+  const add=(key,x,y,kind)=>{id[key]=nodes.length;nodes.push({key,x,y,kind,out:[],inn:[]});return id[key]};
+  for(let r=0;r<CFG.rows;r++)for(let c=0;c<CFG.cols;c++)add(`i${r}${c}`,px(c),py(r),"junction");
+  for(let c=0;c<CFG.cols;c++){add(`bn${c}`,px(c),py(0)-CFG.stub,"border");
+                              add(`bs${c}`,px(c),py(CFG.rows-1)+CFG.stub,"border");}
+  for(let r=0;r<CFG.rows;r++){add(`bw${r}`,px(0)-CFG.stub,py(r),"border");
+                              add(`be${r}`,px(CFG.cols-1)+CFG.stub,py(r),"border");}
+  const E=(a,b)=>{const A=nodes[id[a]],B=nodes[id[b]];
+    const len=Math.hypot(B.x-A.x,B.y-A.y);
+    const e={i:edges.length,a:id[a],b:id[b],len,cars:[],
+             dir:Math.abs(B.x-A.x)>Math.abs(B.y-A.y)?"EW":"NS"};
+    edges.push(e);A.out.push(e);B.inn.push(e)};
+  const both=(a,b)=>{E(a,b);E(b,a)};
+  for(let r=0;r<CFG.rows;r++)for(let c=0;c<CFG.cols;c++){
+    if(c+1<CFG.cols)both(`i${r}${c}`,`i${r}${c+1}`);
+    if(r+1<CFG.rows)both(`i${r}${c}`,`i${r+1}${c}`);
+  }
+  for(let c=0;c<CFG.cols;c++){both(`bn${c}`,`i0${c}`);both(`bs${c}`,`i${CFG.rows-1}${c}`)}
+  for(let r=0;r<CFG.rows;r++){both(`bw${r}`,`i${r}0`);both(`be${r}`,`i${r}${CFG.cols-1}`)}
+  return {nodes,edges,id};
+}
+
+class Sim{
+  constructor(seed=7){
+    this.net=buildNetwork(); this.rng=mulberry(seed);
+    this.mode={signals:"adaptive",routing:"load"};
+    this.demand=900; this.t=0; this.cars=[]; this.doneStats=[];
+    this.spawnAcc=0; this.idc=0;
+    this.borders=this.net.nodes.filter(n=>n.kind==="border");
+    this.signals=this.net.nodes.filter(n=>n.kind==="junction").map(n=>({
+      node:n, phase:this.rng()<.5?"NS":"EW", state:"green", tIn:0}));
+    this.sigByNode={}; this.signals.forEach(s=>this.sigByNode[s.node.key]=s);
+  }
+  edgeCost(e){
+    const base=e.len/CFG.vmax;
+    if(this.mode.routing!=="load") return base;
+    const load=e.cars.length/CFG.cap;
+    return base*(1+CFG.routeAlpha*load*load);
+  }
+  dijkstra(src,dst){
+    const N=this.net.nodes.length, dist=new Array(N).fill(1e18),
+          prevE=new Array(N).fill(null), used=new Array(N).fill(false);
+    dist[src]=0;
+    for(;;){let u=-1,best=1e17;
+      for(let i=0;i<N;i++)if(!used[i]&&dist[i]<best){best=dist[i];u=i}
+      if(u<0||u===dst)break; used[u]=true;
+      for(const e of this.net.nodes[u].out){
+        // border nodes are only enter/exit points, never through-nodes
+        if(this.net.nodes[e.b].kind==="border"&&e.b!==dst)continue;
+        const nd=dist[u]+this.edgeCost(e);
+        if(nd<dist[e.b]){dist[e.b]=nd;prevE[e.b]=e}}}
+    if(!prevE[dst])return null;
+    const path=[];for(let v=dst;prevE[v];v=prevE[v].a)path.unshift(prevE[v]);
+    return path;
+  }
+  spawn(){
+    const a=this.borders[(this.rng()*this.borders.length)|0];
+    let b;do{b=this.borders[(this.rng()*this.borders.length)|0]}while(b===a);
+    const path=this.dijkstra(this.net.nodes.indexOf(a),this.net.nodes.indexOf(b));
+    if(!path)return;
+    const e0=path[0];
+    const last=e0.cars[e0.cars.length-1];
+    if(last&&last.pos<CFG.carLen+CFG.minGap)return;      // entry blocked
+    const car={id:this.idc++,path,leg:0,pos:0,v:CFG.vmax*.6,
+               dst:this.net.nodes.indexOf(b),t0:this.t,wait:0,
+               hue:190+((this.rng()*120)|0)};
+    e0.cars.push(car);
+  }
+  greenFor(sig,edge){        // may this incoming edge proceed?
+    return sig.state==="green"&&sig.phase===edge.dir;
+  }
+  queueLen(e){let q=0;for(const c of e.cars)if(c.v<2&&c.pos>e.len-90)q++;return q}
+  updateSignals(dt){
+    for(const s of this.signals){
+      s.tIn+=dt;
+      if(s.state==="yellow"){ if(s.tIn>=CFG.yellow){s.state="green";s.phase=s.next;s.tIn=0} continue }
+      if(this.mode.signals==="fixed"){
+        if(s.tIn>=CFG.fixedGreen){s.state="yellow";s.next=s.phase==="NS"?"EW":"NS";s.tIn=0}
+      }else{ // adaptive max-pressure: serve the axis with the larger waiting queue
+        if(s.tIn<CFG.minGreen)continue;
+        let pNS=0,pEW=0;
+        for(const e of s.node.inn)(e.dir==="NS"?pNS+=this.queueLen(e):pEW+=this.queueLen(e));
+        const cur=s.phase==="NS"?pNS:pEW, oth=s.phase==="NS"?pEW:pNS;
+        if(oth>cur+1||(cur===0&&oth>0)){s.state="yellow";s.next=s.phase==="NS"?"EW":"NS";s.tIn=0}
+      }
+    }
+  }
+  step(dt){
+    this.t+=dt;
+    this.spawnAcc+=this.demand/3600*dt;
+    while(this.spawnAcc>=1){this.spawn();this.spawnAcc--}
+    this.updateSignals(dt);
+    for(const e of this.net.edges){
+      for(let k=0;k<e.cars.length;k++){
+        const c=e.cars[k];
+        // distance to obstacle: leader on this edge, else stop line / next-edge tail
+        let free=1e9;
+        if(k>0)free=e.cars[k-1].pos-CFG.carLen-c.pos;
+        else{
+          const endNode=this.net.nodes[e.b];
+          const nxt=c.path[c.leg+1];
+          let mustStop=false;
+          if(endNode.kind==="junction"){
+            const sig=this.sigByNode[endNode.key];
+            if(!this.greenFor(sig,e))mustStop=true;
+            else if(nxt){const tail=nxt.cars[nxt.cars.length-1];
+              if(tail&&tail.pos<CFG.carLen+CFG.minGap*0.8)mustStop=true;} // don't block the box
+          }
+          free=mustStop?(e.len-6-c.pos):1e9;
+        }
+        // point-follow controller: accelerate toward vmax, brake to keep spacing
+        const vTarget=Math.max(0,Math.min(CFG.vmax,(free-CFG.minGap)*1.4));
+        c.v+=Math.max(-CFG.acc*2.2,Math.min(CFG.acc,(vTarget-c.v)*4))*dt;
+        if(c.v<0)c.v=0; if(c.v<1.2)c.wait+=dt;
+        c.pos+=c.v*dt;
+        if(c.pos>=e.len){ c.pos=e.len }
+      }
+      // transfers at edge end
+      while(e.cars.length&&e.cars[0].pos>=e.len-0.01){
+        const c=e.cars[0], endNode=this.net.nodes[e.b];
+        if(endNode.kind==="border"){e.cars.shift();
+          this.doneStats.push({trip:this.t-c.t0,wait:c.wait,t:this.t});continue}
+        const sig=this.sigByNode[endNode.key];
+        if(!this.greenFor(sig,e))break;
+        // re-plan from this junction if load-adaptive routing is on
+        if(this.mode.routing==="load"){
+          const np=this.dijkstra(e.b,c.dst);
+          if(np){c.path=c.path.slice(0,c.leg+1).concat(np)}
+        }
+        const nxt=c.path[c.leg+1];
+        if(!nxt)break;
+        const tail=nxt.cars[nxt.cars.length-1];
+        if(tail&&tail.pos<CFG.carLen+CFG.minGap*0.8)break;
+        e.cars.shift();c.leg++;c.pos=0;nxt.cars.push(c);
+      }
+    }
+  }
+  stats(win=120){
+    const cut=this.t-win, rec=this.doneStats.filter(d=>d.t>=cut);
+    const n=rec.length;
+    return {active:this.net.edges.reduce((s,e)=>s+e.cars.length,0),
+      trip:n?rec.reduce((s,d)=>s+d.trip,0)/n:null,
+      wait:n?rec.reduce((s,d)=>s+d.wait,0)/n:null,
+      thruH:n*3600/Math.min(win,Math.max(this.t,1)), n};
+  }
+}
+
+/* ---------- headless smoke test when run under Node ---------- */
+if(typeof document==="undefined"){
+  for(const conf of [["fixed","static"],["adaptive","load"]]){
+    const s=new Sim(7);s.mode.signals=conf[0];s.mode.routing=conf[1];s.demand=1400;
+    for(let i=0;i<240*30;i++)s.step(1/30);       // 4 simulated minutes
+    const st=s.stats(240);
+    console.log(conf.join("+"),"=> done:",s.doneStats.length,
+      "avg trip:",st.trip&&st.trip.toFixed(1),"avg wait:",st.wait&&st.wait.toFixed(1),
+      "active:",st.active);
+    if(s.doneStats.length<50)throw new Error("too few completions — flow broken");
+  }
+  console.log("SMOKE TEST PASS");
+}
+
+/* ================= RENDER + UI (browser only) =============================== */
+if(typeof document!=="undefined"){
+  const sim=new Sim(7);
+  const cv=document.getElementById("cv"),ctx=cv.getContext("2d");
+  let paused=false,speed=2;
+  const board={};   // strategy -> {sum,n}
+  function fit(){const r=cv.parentElement.getBoundingClientRect();
+    cv.width=r.width*devicePixelRatio;cv.height=r.height*devicePixelRatio}
+  addEventListener("resize",fit);fit();
+
+  function world2px(){
+    const W=140*2+(CFG.cols-1)*CFG.gap+2*(CFG.stub-60),
+          H=110*2+(CFG.rows-1)*CFG.gap+2*(CFG.stub-60);
+    const s=Math.min(cv.width/(W+40),cv.height/(H-40));
+    return {s,ox:(cv.width-(W-90)*s)/2-40*s,oy:(cv.height-(H-110)*s)/2-30*s};
+  }
+  function draw(){
+    const {s,ox,oy}=world2px();
+    const X=x=>ox+x*s, Y=y=>oy+y*s;
+    ctx.fillStyle="#101317";ctx.fillRect(0,0,cv.width,cv.height);
+    // roads with load glow
+    for(const e of sim.net.edges){
+      const A=sim.net.nodes[e.a],B=sim.net.nodes[e.b];
+      const nx=(B.y-A.y)/e.len,ny=-(B.x-A.x)/e.len,off=5.5*s;
+      const load=Math.min(1,e.cars.length/CFG.cap);
+      ctx.strokeStyle=`rgba(${40+215*load},${60+80*(1-load)+120*load*0},${70*(1-load)},${.18+.5*load})`;
+      ctx.lineWidth=(9+8*load)*s;ctx.lineCap="round";
+      ctx.beginPath();ctx.moveTo(X(A.x)+nx*off,Y(A.y)+ny*off);
+      ctx.lineTo(X(B.x)+nx*off,Y(B.y)+ny*off);ctx.stroke();
+      ctx.strokeStyle="#1c2128";ctx.lineWidth=7*s;
+      ctx.beginPath();ctx.moveTo(X(A.x)+nx*off,Y(A.y)+ny*off);
+      ctx.lineTo(X(B.x)+nx*off,Y(B.y)+ny*off);ctx.stroke();
+      ctx.setLineDash([6*s,9*s]);ctx.strokeStyle="rgba(232,182,76,.35)";ctx.lineWidth=1;
+      ctx.beginPath();ctx.moveTo(X(A.x)+nx*off,Y(A.y)+ny*off);
+      ctx.lineTo(X(B.x)+nx*off,Y(B.y)+ny*off);ctx.stroke();ctx.setLineDash([]);
+      // cars
+      for(const c of e.cars){
+        const t=c.pos/e.len,cx=A.x+(B.x-A.x)*t+nx*5.5,cy=A.y+(B.y-A.y)*t+ny*5.5;
+        ctx.save();ctx.translate(X(cx),Y(cy));
+        ctx.rotate(Math.atan2(B.y-A.y,B.x-A.x));
+        ctx.fillStyle=c.v<1.5?"#ef5350":`hsl(${c.hue} 70% 62%)`;
+        ctx.fillRect(-4.5*s,-2.6*s,9*s,5.2*s);ctx.restore();
+      }
+    }
+    // signals
+    for(const g of sim.signals){
+      const n=g.node;
+      ctx.fillStyle="#0b0d10";ctx.beginPath();
+      ctx.arc(X(n.x),Y(n.y),10*s,0,7);ctx.fill();
+      const col=g.state==="yellow"?"#f0a832":"#3ecf7a";
+      ctx.strokeStyle=col;ctx.lineWidth=3*s;ctx.beginPath();
+      if(g.phase==="NS"&&g.state!=="yellow"||g.state==="yellow"&&g.next==="EW"){
+        ctx.moveTo(X(n.x),Y(n.y)-8*s);ctx.lineTo(X(n.x),Y(n.y)+8*s);
+      }else{ctx.moveTo(X(n.x)-8*s,Y(n.y));ctx.lineTo(X(n.x)+8*s,Y(n.y));}
+      ctx.stroke();
+    }
+    // border labels
+    ctx.fillStyle="#454e5c";ctx.font=`${10*s}px ui-monospace,monospace`;
+    for(const b of sim.borders)ctx.fillText("◈",X(b.x)-4*s,Y(b.y)+3*s);
+  }
+  function keyOf(){return sim.mode.signals+"|"+sim.mode.routing}
+  function refreshBoard(){
+    const el=document.getElementById("board");
+    el.innerHTML="<tr><th>signals</th><th>routing</th><th>trip</th><th>n</th></tr>";
+    let best=1e9;for(const k in board)if(board[k].n>20)best=Math.min(best,board[k].sum/board[k].n);
+    for(const k in board){const [sg,rt]=k.split("|"),v=board[k];
+      const avg=v.n?v.sum/v.n:0;
+      el.insertAdjacentHTML("beforeend",
+        `<tr><td>${sg}</td><td>${rt}</td><td class="${v.n>20&&avg<=best+0.01?'best':''}">${v.n?avg.toFixed(1):"–"}</td><td>${v.n}</td></tr>`)}
+  }
+  let acc=0,last=performance.now(),hudT=0;
+  function loop(now){
+    const dt=Math.min(0.05,(now-last)/1000);last=now;
+    if(!paused){acc+=dt*speed;
+      while(acc>1/60){sim.step(1/60);acc-=1/60;
+        // fold completions into scoreboard
+        while(sim.doneStats.length&&sim.doneStats._read!==sim.doneStats.length){
+          const i=sim.doneStats._read||0;if(i>=sim.doneStats.length)break;
+          const d=sim.doneStats[i];const k=keyOf();
+          (board[k]=board[k]||{sum:0,n:0});board[k].sum+=d.trip;board[k].n++;
+          sim.doneStats._read=i+1;
+        }
+      }}
+    draw();
+    hudT+=dt;
+    if(hudT>0.5){hudT=0;const st=sim.stats();
+      sTrip.textContent=st.trip?st.trip.toFixed(0):"–";
+      sWait.textContent=st.wait?st.wait.toFixed(0):"–";
+      sThru.textContent=Math.round(st.thruH);
+      sAct.textContent=st.active;refreshBoard();}
+    requestAnimationFrame(loop);
+  }
+  // controls
+  const seg=(id,fn)=>{const el=document.getElementById(id);
+    el.addEventListener("click",ev=>{const b=ev.target.closest("button");if(!b)return;
+      el.querySelectorAll("button").forEach(x=>x.className="");
+      b.classList.add("on",id==="sigSeg"?"go":"rt");fn(b.dataset.v)})};
+  seg("sigSeg",v=>sim.mode.signals=v);
+  seg("rtSeg",v=>sim.mode.routing=v);
+  dem.oninput=()=>{sim.demand=+dem.value;demV.textContent=dem.value+" veh/h"};
+  spd.oninput=()=>{speed=+spd.value;spdV.textContent=spd.value+"×"};
+  pause.onclick=()=>{paused=!paused;pause.textContent=paused?"Resume":"Pause"};
+  reset.onclick=()=>{const m={...sim.mode},d=sim.demand;
+    Object.assign(sim,new Sim((Math.random()*1e6)|0));sim.mode=m;sim.demand=d};
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
