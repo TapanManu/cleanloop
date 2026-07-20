@@ -1,3 +1,3 @@
-### CLEANLOOP = WASTE MANAGEMENT + TRAFFIC MANAGEMENT
+# CLEANLOOP 
 
-hybrid of both waste management and traffic management
+Hybrid of both waste management and traffic management protocols and simulations
